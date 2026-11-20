@@ -1,0 +1,5 @@
+if(EXISTS "/srv/fb2/feng0732/0081-srt-1-7f79b76d/build-hlog/test-srt[1]_tests.cmake")
+  include("/srv/fb2/feng0732/0081-srt-1-7f79b76d/build-hlog/test-srt[1]_tests.cmake")
+else()
+  add_test(test-srt_NOT_BUILT test-srt_NOT_BUILT)
+endif()

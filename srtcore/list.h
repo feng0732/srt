@@ -54,6 +54,8 @@ modified by
 #define INC_SRT_LIST_H
 
 #include <deque>
+#include <utility>
+#include <vector>
 
 #include "udt.h"
 #include "common.h"
@@ -273,6 +275,58 @@ public:
 
     iterator begin() { return iterator(m_caSeq, m_iHead); }
     iterator end() { return iterator(m_caSeq, -1); }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+/// Loss record for irrecoverable losses reported by the packet filter (e.g. FEC).
+///
+/// With an on-demand ARQ fallback level (e.g. SRT_ARQ_ONREQ) the filter reports
+/// a loss only when it is certain that the filter itself cannot recover it
+/// (e.g. when a FEC group is dismissed). Such reports may therefore come out of
+/// sequence order and overlapping with already recorded ones, which the
+/// CRcvLossList container doesn't support. This container accepts loss records
+/// in any order, merging overlapping and adjacent ranges to prevent duplicates,
+/// so that the losses confirmed by the filter can be re-reported periodically
+/// (NAKREPORT) until they are recovered or dropped.
+class CRcvFilterLossList
+{
+public:
+    typedef std::pair<int32_t, int32_t> SeqRange; //< <first, last> sequence of a loss range (inclusive)
+
+    /// Insert a series of loss seq. no. between "seqlo" and "seqhi" (inclusive).
+    /// Records may come in any order and may overlap the already recorded ones;
+    /// overlapping and adjacent ranges are merged, so that inserting a duplicated
+    /// or partially recorded loss doesn't create duplicated records.
+    /// @param [in] seqlo sequence number starts.
+    /// @param [in] seqhi sequence number ends.
+    void insert(int32_t seqlo, int32_t seqhi);
+
+    /// Remove a loss seq. no. from the list (e.g. a recovered packet).
+    /// @param [in] seq sequence number.
+    /// @return if the packet was recorded and has been removed (true) or not found (false).
+    bool remove(int32_t seq);
+
+    /// Remove all packets between seqlo and seqhi (inclusive),
+    /// e.g. losses dropped per DROPREQ.
+    /// @param [in] seqlo start sequence number.
+    /// @param [in] seqhi end sequence number.
+    void remove(int32_t seqlo, int32_t seqhi);
+
+    /// Remove all numbers that precede the given sequence number,
+    /// including the number itself (e.g. losses dropped per TLPKTDROP).
+    /// @param [in] seq sequence number.
+    void removeUpTo(int32_t seq);
+
+    /// Check if there are no losses recorded.
+    bool empty() const { return m_ranges.empty(); }
+
+    /// Get the recorded losses as a list of <lo, hi> ranges, ordered by
+    /// sequence, non-overlapping and non-adjacent.
+    const std::vector<SeqRange>& ranges() const { return m_ranges; }
+
+private:
+    std::vector<SeqRange> m_ranges;
 };
 
 struct CRcvFreshLoss

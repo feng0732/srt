@@ -814,6 +814,170 @@ int srt::CRcvLossList::getLossArray(FixedArray<int32_t>& array)
     return len;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
+void srt::CRcvFilterLossList::insert(int32_t seqlo, int32_t seqhi)
+{
+    SRT_ASSERT(seqlo != SRT_SEQNO_NONE && seqhi != SRT_SEQNO_NONE);
+    SRT_ASSERT(CSeqNo::seqcmp(seqlo, seqhi) <= 0);
+
+    // Merge the new range with every recorded range that overlaps it or
+    // sticks to it. The recorded ranges are ordered by sequence and are
+    // neither overlapping nor adjacent, so the merged range is placed
+    // exactly where the first absorbed range was found.
+    std::vector<SeqRange> merged;
+    merged.reserve(m_ranges.size() + 1);
+
+    bool inserted = false;
+    for (size_t i = 0; i < m_ranges.size(); ++i)
+    {
+        const SeqRange r = m_ranges[i];
+
+        // The recorded range lies completely before the new one and
+        // doesn't stick to it.
+        if (CSeqNo::seqcmp(r.second, CSeqNo::decseq(seqlo)) < 0)
+        {
+            merged.push_back(r);
+            continue;
+        }
+
+        // The recorded range lies completely past the new one and
+        // doesn't stick to it. All following ranges are even further,
+        // so place the new range right here.
+        if (CSeqNo::seqcmp(CSeqNo::incseq(seqhi), r.first) < 0)
+        {
+            if (!inserted)
+            {
+                merged.push_back(std::make_pair(seqlo, seqhi));
+                inserted = true;
+            }
+            merged.push_back(r);
+            continue;
+        }
+
+        // The ranges overlap or stick together: absorb the recorded range.
+        if (CSeqNo::seqcmp(r.first, seqlo) < 0)
+            seqlo = r.first;
+        if (CSeqNo::seqcmp(r.second, seqhi) > 0)
+            seqhi = r.second;
+    }
+
+    if (!inserted)
+        merged.push_back(std::make_pair(seqlo, seqhi));
+
+    m_ranges.swap(merged);
+}
+
+bool srt::CRcvFilterLossList::remove(int32_t seq)
+{
+    for (size_t i = 0; i < m_ranges.size(); ++i)
+    {
+        SeqRange& r = m_ranges[i];
+
+        // Ranges are ordered by sequence; no more matches past this one.
+        if (CSeqNo::seqcmp(r.first, seq) > 0)
+            return false;
+
+        // The range lies completely before the sequence.
+        if (CSeqNo::seqcmp(seq, r.second) > 0)
+            continue;
+
+        // The sequence is inside the range.
+        if (r.first == seq)
+        {
+            if (r.second == seq)
+                m_ranges.erase(m_ranges.begin() + i);
+            else
+                r.first = CSeqNo::incseq(seq);
+        }
+        else if (r.second == seq)
+        {
+            r.second = CSeqNo::decseq(seq);
+        }
+        else
+        {
+            // The sequence is in the middle of the range: split it into two.
+            const SeqRange tail = std::make_pair(CSeqNo::incseq(seq), r.second);
+            r.second = CSeqNo::decseq(seq);
+            m_ranges.insert(m_ranges.begin() + i + 1, tail);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void srt::CRcvFilterLossList::remove(int32_t seqlo, int32_t seqhi)
+{
+    for (size_t i = 0; i < m_ranges.size();)
+    {
+        SeqRange& r = m_ranges[i];
+
+        // The range lies completely before the removed one.
+        if (CSeqNo::seqcmp(r.second, seqlo) < 0)
+        {
+            ++i;
+            continue;
+        }
+
+        // The range lies completely past the removed one; no more matches.
+        if (CSeqNo::seqcmp(r.first, seqhi) > 0)
+            break;
+
+        const bool covers_lo = CSeqNo::seqcmp(r.first, seqlo) >= 0; // removal covers the range's start
+        const bool covers_hi = CSeqNo::seqcmp(r.second, seqhi) <= 0; // removal covers the range's end
+
+        if (covers_lo && covers_hi)
+        {
+            // The range is completely covered by the removed one.
+            m_ranges.erase(m_ranges.begin() + i);
+            continue; // the next element has shifted into i
+        }
+
+        if (covers_lo)
+        {
+            r.first = CSeqNo::incseq(seqhi);
+            ++i;
+            continue;
+        }
+
+        if (covers_hi)
+        {
+            r.second = CSeqNo::decseq(seqlo);
+            ++i;
+            continue;
+        }
+
+        // The removed range lies inside the recorded one: split it into two.
+        // Nothing past the split range can overlap the removed one.
+        const SeqRange tail = std::make_pair(CSeqNo::incseq(seqhi), r.second);
+        r.second = CSeqNo::decseq(seqlo);
+        m_ranges.insert(m_ranges.begin() + i + 1, tail);
+        return;
+    }
+}
+
+void srt::CRcvFilterLossList::removeUpTo(int32_t seq)
+{
+    // The ranges are ordered by sequence, so only the head ones can match.
+    while (!m_ranges.empty())
+    {
+        SeqRange& r = m_ranges.front();
+
+        if (CSeqNo::seqcmp(r.second, seq) <= 0)
+        {
+            // The whole range precedes the sequence (inclusive).
+            m_ranges.erase(m_ranges.begin());
+            continue;
+        }
+
+        if (CSeqNo::seqcmp(r.first, seq) <= 0)
+            r.first = CSeqNo::incseq(seq); // strip the covered head of the range
+
+        break;
+    }
+}
+
 srt::CRcvFreshLoss::CRcvFreshLoss(int32_t seqlo, int32_t seqhi, int initial_age)
     : ttl(initial_age)
     , timestamp(steady_clock::now())

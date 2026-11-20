@@ -11372,6 +11372,22 @@ int srt::CUDT::processData(CUnit* in_unit)
         HLOGC(qrlog.Debug, log << CONID() << "WILL REPORT LOSSES (filter): " << Printable(filter_loss_seqs));
         sendLossReport(filter_loss_seqs);
 
+        // Record the losses confirmed irrecoverable by the filter, so that
+        // they can be re-reported periodically (NAKREPORT) until recovered
+        // or dropped. A loss of this single LOSSREPORT or of the retransmission
+        // it triggers would otherwise make the loss unrecoverable. This is
+        // only done when NAKREPORT is enabled and the re-report can apply
+        // (on-demand ARQ fallback level); the record is not used otherwise.
+        if (m_config.bRcvNakReport && m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
+        {
+            ScopedLock lock(m_RcvLossLock);
+            for (loss_seqs_t::const_iterator i = filter_loss_seqs.begin(); i != filter_loss_seqs.end(); ++i)
+                m_FilterLossList.insert(i->first, i->second);
+
+            HLOGC(qrlog.Debug, log << CONID() << "processData: RECORDING FILTER LOSS for re-report: "
+                    << Printable(filter_loss_seqs));
+        }
+
         if (m_bTsbPd)
         {
             HLOGC(qrlog.Debug, log << CONID() << "loss: signaling TSBPD cond");
@@ -11588,6 +11604,15 @@ void srt::CUDT::unlose(const CPacket &packet)
     int32_t sequence = packet.seqno();
     m_pRcvLossList->remove(sequence);
 
+    // If this sequence was reported by the packet filter (e.g. FEC) as an
+    // irrecoverable loss, it has now been recovered, so withdraw it from
+    // the periodic re-report record to stop reporting it as lost.
+    if (!m_FilterLossList.empty() && m_FilterLossList.remove(sequence))
+    {
+        HLOGC(qrlog.Debug, log << CONID() << "unlose: sequence %" << sequence
+                << " recovered - removed from filter loss re-report record");
+    }
+
     // Rest of this code concerns only the "belated lossreport" feature.
 
     bool has_increased_tolerance = false;
@@ -11686,12 +11711,16 @@ void srt::CUDT::dropFromLossLists(int32_t from, int32_t to)
     if (from == SRT_SEQNO_NONE)
     {
         begin = m_pRcvLossList->removeUpTo(to);
+        // Losses dropped per TLPKTDROP must no longer be re-reported.
+        m_FilterLossList.removeUpTo(to);
         IF_HEAVY_LOGGING(autodetected = true);
     }
     else
     {
         begin = from;
         m_pRcvLossList->remove(from, to);
+        // Losses dropped per DROPREQ must no longer be re-reported.
+        m_FilterLossList.remove(from, to);
     }
 
 #if ENABLE_HEAVY_LOGGING
@@ -12211,19 +12240,59 @@ int srt::CUDT::checkACKTimer(const steady_clock::time_point &currtime)
 
 int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
 {
-    // XXX The problem with working NAKREPORT with SRT_ARQ_ONREQ
-    // is not that it would be inappropriate, but because it's not
-    // implemented. The reason for it is that the structure of the
-    // loss list container (m_pRcvLossList) is such that it is expected
-    // that the loss records are ordered by sequence numbers (so
-    // that two ranges sticking together are merged in place).
-    // Unfortunately in case of SRT_ARQ_ONREQ losses must be recorded
-    // as before, but they should not be reported, until confirmed
-    // by the filter. By this reason they appear often out of order
-    // and for adding them properly the loss list container wasn't
-    // prepared. This then requires some more effort to implement.
-    if (!m_config.bRcvNakReport || m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
+    if (!m_config.bRcvNakReport)
         return BECAUSE_NO_REASON;
+
+    // With a packet filter (e.g. FEC) using an on-demand ARQ fallback level
+    // (e.g. SRT_ARQ_ONREQ), the losses recorded by SRT in m_pRcvLossList must
+    // not be reported before the filter confirms them as irrecoverable, and
+    // the filter may confirm them out of sequence order (e.g. when a FEC group
+    // is dismissed), which the m_pRcvLossList container doesn't support.
+    // Therefore the losses confirmed by the filter are recorded separately in
+    // m_FilterLossList (see processData) and re-reported periodically from
+    // there, so that a lost LOSSREPORT or a lost retransmission doesn't make
+    // the loss unrecoverable. Recovered or dropped losses are removed from
+    // the record (see unlose and dropFromLossLists), so no stale reports are
+    // sent. Re-reporting uses the regular LOSSREPORT, so the sender handles
+    // it with the normal retransmission procedure, and repeated reports don't
+    // duplicate retransmissions of losses already pending in the sender loss
+    // list. With SRT_ARQ_NEVER the filter never reports losses, so the record
+    // stays empty and nothing is re-reported.
+    if (m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
+    {
+        enterCS(m_RcvLossLock);
+        const bool have_filter_loss = !m_FilterLossList.empty();
+        leaveCS(m_RcvLossLock);
+
+        int debug_decision = BECAUSE_NO_REASON;
+
+        if (have_filter_loss)
+        {
+            if (currtime <= m_tsNextNAKTime.load())
+                return BECAUSE_NO_REASON; // wait for next NAK time
+
+            // Take a snapshot of the currently unrecovered losses and
+            // re-report them. The snapshot is taken under the lock, but
+            // sent outside of it, as sendLossReport doesn't require it.
+            loss_seqs_t filter_losses;
+            {
+                ScopedLock lock(m_RcvLossLock);
+                const std::vector<CRcvFilterLossList::SeqRange>& ranges = m_FilterLossList.ranges();
+                filter_losses.assign(ranges.begin(), ranges.end());
+            }
+
+            if (!filter_losses.empty())
+            {
+                HLOGC(qrlog.Debug, log << CONID() << "checkNAKTimer: RE-REPORT LOSSES (filter): "
+                        << Printable(filter_losses));
+                sendLossReport(filter_losses);
+                debug_decision = BECAUSE_NAKREPORT;
+            }
+        }
+
+        m_tsNextNAKTime.store(currtime + m_tdNAKInterval);
+        return debug_decision;
+    }
 
     /*
      * m_config.bRcvNakReport enables NAK reports for SRT.

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <set>
 #include <sys/select.h>
 #include <unistd.h>
 #endif
@@ -1373,6 +1374,74 @@ TEST(TestFECGCM, UndecryptedPacketsAreRetransmitted)
 TEST(TestFECGCM, UndecryptedPacketsAreRetransmittedWithFEC)
 {
     CheckUndecryptedPacketsRetransmitted("fec,cols:10,rows:1,arq:onreq");
+}
+
+// Drops two original data packets per FEC row of 10, so that the row FEC
+// packet cannot recover either of them and both are reported by the filter
+// as irrecoverable (arq:onreq). Additionally drops the first retransmission
+// of every packet, so that the loss can only be recovered if the receiver
+// re-reports it (periodic NAKREPORT of filter-reported losses).
+static LossyRelay::Filter DropDataAndFirstRexmit()
+{
+    struct State
+    {
+        int              count;
+        std::set<uint32_t> dropped_rexmit;
+        State()
+            : count(0)
+        {
+        }
+    };
+    std::shared_ptr<State> st = std::make_shared<State>();
+    return [st](vector<char>& pkt) {
+        if (pkt.size() <= SRT_PH_E_SIZE * sizeof(uint32_t))
+            return true;
+        uint32_t hdr[2];
+        memcpy(hdr, &pkt[0], sizeof hdr);
+        const uint32_t seqword = ntohl(hdr[SRT_PH_SEQNO]);
+        const uint32_t msgword = ntohl(hdr[SRT_PH_MSGNO]);
+
+        // Skip control packets and FEC control packets (msgno 0).
+        if (SEQNO_CONTROL::unwrap(seqword) || MSGNO_SEQ::unwrap(msgword) == 0)
+            return true;
+
+        if (MSGNO_REXMIT::unwrap(msgword))
+        {
+            // Drop the first retransmission of every packet; pass the
+            // retransmissions triggered by the repeated loss reports.
+            return !st->dropped_rexmit.insert(seqword).second;
+        }
+
+        const int index = st->count++;
+        if (index < 80 && (index % 10 == 3 || index % 10 == 7))
+            return false;
+        return true;
+    };
+}
+
+// A loss that the FEC filter reported as irrecoverable (arq:onreq) is
+// re-requested by the receiver only once. If the retransmission it triggered
+// gets lost, the receiver must re-report the loss periodically (NAKREPORT),
+// so that the sender retransmits it again and the loss is finally recovered
+// instead of being dropped by TLPKTDROP.
+TEST(TestFECGCM, IrrecoverableLossRereported)
+{
+    const int   nmsg = 100;
+    vector<int> received;
+    SRT_TRACEBSTATS stats;
+    memset(&stats, 0, sizeof stats);
+    RunThroughRelay("fec,cols:10,rows:1,arq:onreq", DropDataAndFirstRexmit(), nmsg, received, stats);
+    if (::testing::Test::HasFatalFailure() || ::testing::Test::IsSkipped())
+        return;
+
+    ASSERT_EQ(received.size(), size_t(nmsg));
+    for (int i = 0; i < nmsg; ++i)
+        EXPECT_EQ(received[i], i);
+
+    // Two irrecoverable losses per FEC row of 10 among the first 80 packets,
+    // each recovered by a retransmission repeated after the re-report.
+    EXPECT_EQ(stats.pktRcvFilterLossTotal, 16);
+    EXPECT_EQ(stats.pktRcvDropTotal, 0);
 }
 
 #endif // ENABLE_AEAD_API_PREVIEW && SRT_ENABLE_ENCRYPTION && !_WIN32

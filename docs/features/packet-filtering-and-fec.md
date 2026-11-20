@@ -116,7 +116,10 @@ possible values are:
     * **onreq**: ARQ is allowed, but a loss is only reported when FEC fails to
     rebuild, at the moment when an incoming packet has a sequence number that
     exceeds the last in one of the column groups; such a packet, if still lacking
-    at that moment, is considered no longer recoverable by FEC.
+    at that moment, is considered no longer recoverable by FEC. Once reported,
+    the loss is also re-reported periodically (as per NAKREPORT, see
+    `SRTO_NAKREPORT`) until the packet is recovered or dropped, so that a lost
+    LOSSREPORT or a lost retransmission doesn't make the loss unrecoverable.
 
     * **never**: ARQ is not done at all. Packets not recovered by FEC undergo
     TLPKTDROP, just like those that fail ARQ recovery in a conventional SRT

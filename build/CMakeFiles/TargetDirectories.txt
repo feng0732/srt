@@ -1,0 +1,13 @@
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt_virtual.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt_shared.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt_static.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srtsupport_virtual.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt-live-transmit.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt-file-transmit.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/srt-tunnel.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/edit_cache.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/rebuild_cache.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/list_install_components.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/install.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/install/local.dir
+/srv/fb2/feng0732/0081-srt-1-7f79b76d/build/CMakeFiles/install/strip.dir

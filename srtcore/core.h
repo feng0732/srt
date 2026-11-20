@@ -1137,6 +1137,8 @@ private: // Receiving related data
     CRcvLossList* m_pRcvLossList;                //< Receiver loss list
     SRT_ATTR_GUARDED_BY(m_RcvLossLock)
     std::deque<CRcvFreshLoss> m_FreshLoss;       //< Lost sequence already added to m_pRcvLossList, but not yet sent UMSG_LOSSREPORT for.
+    SRT_ATTR_GUARDED_BY(m_RcvLossLock)
+    CRcvFilterLossList m_FilterLossList;         //< Irrecoverable losses reported by the packet filter (e.g. FEC), pending periodic re-report (NAKREPORT).
 
     int m_iReorderTolerance;                     //< Current value of dynamic reorder tolerance
     int m_iConsecEarlyDelivery;                  //< Increases with every OOO packet that came <TTL-2 time, resets with every increased reorder tolerance

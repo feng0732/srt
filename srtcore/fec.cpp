@@ -1152,7 +1152,10 @@ void FECFilterBuiltin::CollectIrrecoverRow(RcvGroup& g, loss_seqs_t& irrecover) 
         }
         else if (last && !gone)
         {
-            val.second = CSeqNo::incseq(base, int(i));
+            // Switch loss -> full. The loss range ends at the previous
+            // cell; the current one was received, so it must not be
+            // included in the loss range.
+            val.second = CSeqNo::incseq(base, int(i) - 1);
             irrecover.push_back(val);
         }
     }
