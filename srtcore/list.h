@@ -54,16 +54,28 @@ modified by
 #define INC_SRT_LIST_H
 
 #include <deque>
+#include <vector>
 
 #include "udt.h"
 #include "common.h"
 #include "utilities.h"
+#include "sync.h"
 
 namespace srt {
 
 class CSndLossList
 {
 public:
+    typedef srt::sync::steady_clock::time_point time_point;
+
+    /// A loss record augmented with the packet's retransmission deadline.
+    /// Used by the deadline-aware retransmission scheduler.
+    struct LossEntry
+    {
+        int32_t    seq;
+        time_point deadline;
+    };
+
     CSndLossList(int size = 1024);
     ~CSndLossList();
 
@@ -73,9 +85,24 @@ public:
     /// @return number of packets that are not in the list previously.
     int insert(int32_t seqno1, int32_t seqno2);
 
+    /// Insert a seq. no. into the sender loss list and attach a retransmission
+    /// deadline to every newly inserted sequence of the range. Sequences that
+    /// are already recorded keep their previously recorded deadline.
+    /// @param [in] seqno1 sequence number starts.
+    /// @param [in] seqno2 sequence number ends.
+    /// @param [in] deadline retransmission (playback) deadline for the packets.
+    /// @return number of packets that are not in the list previously.
+    int insert(int32_t seqno1, int32_t seqno2, const time_point& deadline);
+
     /// Remove the given sequence number and all numbers that precede it.
     /// @param [in] seqno sequence number.
     void removeUpTo(int32_t seqno);
+
+    /// Remove a single sequence number from the list, splitting the containing
+    /// range if necessary.
+    /// @param [in] seqno sequence number.
+    /// @return true if the sequence was recorded and got removed, false otherwise.
+    bool remove(int32_t seqno);
 
     /// Read the loss length.∏
     /// @return The length of the list.
@@ -84,6 +111,34 @@ public:
     /// Read the first (smallest) loss seq. no. in the list and remove it.
     /// @return The seq. no. or -1 if the list is empty.
     int32_t popLostSeq();
+
+    /// Read the first (smallest) loss seq. no. in the list and remove it,
+    /// returning its recorded deadline (epoch time_point if none was attached).
+    /// @param [out] w_deadline deadline recorded for the popped sequence.
+    /// @return The seq. no. or SRT_SEQNO_NONE if the list is empty.
+    int32_t popLostSeq(time_point& w_deadline);
+
+    /// Look up the deadline recorded for a sequence.
+    /// @param [in] seqno sequence number.
+    /// @return The recorded deadline, or an epoch time_point if the sequence
+    ///         is not currently recorded (or no deadline was attached to it).
+    time_point getDeadline(int32_t seqno) const;
+
+    /// Check whether a sequence is currently recorded in the loss list.
+    bool find(int32_t seqno) const;
+
+    /// Snapshot all currently recorded loss sequences together with their
+    /// deadlines. The snapshot is taken atomically under the list lock and is
+    /// intended for the deadline-aware scheduler, which must not mutate the
+    /// list while selecting the best retransmission candidate.
+    /// @param [out] w_entries receives (seqno, deadline) pairs, in no
+    ///               particular order. Cleared before filling.
+    void snapshot(std::vector<LossEntry>& w_entries) const;
+
+    /// Clear every recorded deadline while keeping the loss records intact.
+    /// Used when the time basis changes (e.g. a clock regression) and all
+    /// deadlines must be re-derived from the current clock.
+    void clearAllDeadlines();
 
     template <class Stream>
     Stream& traceState(Stream& sout) const
@@ -120,12 +175,35 @@ private:
         int     inext;    // index of the next node in the list
     } * m_caSeq;
 
+    // Per-physical-slot retransmission deadlines, parallel to m_caSeq.
+    // m_caDeadline[slot] is meaningful only while the sequence number that
+    // occupies this slot (head seqno + slot distance, modulo m_iSize) is
+    // recorded in the loss list. An epoch time_point means "no deadline".
+    time_point* m_caDeadline;
+
     int       m_iHead;          // first node
     int       m_iLength;        // loss length
     const int m_iSize;          // size of the static array
     int       m_iLastInsertPos; // position of last insert node
 
     mutable srt::sync::Mutex m_ListLock; // used to synchronize list operation
+
+private:
+    /// Physical slot of a sequence number currently covered by the list.
+    /// The caller must guarantee that the sequence is within the occupied
+    /// region (between head seqstart and the furthest recorded sequence).
+    int slotOf(int32_t seqno) const
+    {
+        return (m_iHead + CSeqNo::seqoff(m_caSeq[m_iHead].seqstart, seqno) + m_iSize) % m_iSize;
+    }
+
+    /// Attach a deadline to every sequence of [seqno1, seqno2]. No lock.
+    /// Only slots that do not already carry a deadline are written, so
+    /// deadlines of already recorded sequences are never overwritten.
+    void assignDeadlines(int32_t seqno1, int32_t seqno2, const time_point& deadline);
+
+    /// Clear the deadline associated with the given sequence. No lock.
+    void clearDeadline(int32_t seqno);
 
 private:
     /// Inserts an element to the beginning and updates head pointer.

@@ -212,6 +212,7 @@ struct SrtOptionAction
 #endif
         flags[SRTO_PACKETFILTER]       = SRTO_R_PRE;
         flags[SRTO_RETRANSMITALGO]     = SRTO_R_PRE;
+        flags[SRTO_REXMITDEADLINE]     = SRTO_R_PRE;
 #ifdef ENABLE_AEAD_API_PREVIEW
         flags[SRTO_CRYPTOMODE]         = SRTO_R_PRE;
 #endif
@@ -397,6 +398,8 @@ void srt::CUDT::construct()
     m_pRcvBuffer           = NULL;
     m_pSndLossList         = NULL;
     m_pRcvLossList         = NULL;
+    m_tsLastRexmitSchedule = steady_clock::time_point();
+    m_tsRexmitPacedSince   = steady_clock::time_point();
     m_iReorderTolerance    = 0;
     // How many times so far the packet considered lost has been received
     // before TTL expires.
@@ -982,6 +985,11 @@ void srt::CUDT::getOpt(SRT_SOCKOPT optName, void *optval, int &optlen)
 
     case SRTO_RETRANSMITALGO:
         *(int32_t *)optval = m_config.iRetransmitAlgo;
+        optlen         = sizeof(int32_t);
+        break;
+
+    case SRTO_REXMITDEADLINE:
+        *(int32_t *)optval = m_config.iRexmitDeadline_ms;
         optlen         = sizeof(int32_t);
         break;
 #ifdef ENABLE_AEAD_API_PREVIEW
@@ -9259,7 +9267,7 @@ bool srt::CUDT::processCtrlLossReport(const CPacket& ctrlpkt)
                 {
                     HLOGC(inlog.Debug, log << CONID() << "LOSSREPORT: adding "
                         << losslist_lo << " - " << losslist_hi << " to loss list");
-                    num = m_pSndLossList->insert(losslist_lo, losslist_hi);
+                    num = insertLossWithDeadline(losslist_lo, losslist_hi);
                 }
                 // ELSE losslist_lo %< m_iSndLastAck
                 else
@@ -9283,7 +9291,7 @@ bool srt::CUDT::processCtrlLossReport(const CPacket& ctrlpkt)
                     {
                         HLOGC(inlog.Debug, log << CONID() << "LOSSREPORT: adding "
                                 << m_iSndLastAck << "[ACK] - " << losslist_hi << " to loss list");
-                        num = m_pSndLossList->insert(m_iSndLastAck, losslist_hi);
+                        num = insertLossWithDeadline(m_iSndLastAck, losslist_hi);
                         dropreq_hi = CSeqNo::decseq(m_iSndLastAck);
                         IF_HEAVY_LOGGING(drop_type = "partially");
                     }
@@ -9325,7 +9333,7 @@ bool srt::CUDT::processCtrlLossReport(const CPacket& ctrlpkt)
 
                     HLOGC(inlog.Debug,
                             log << CONID() << "LOSSREPORT: adding %" << losslist[i] << " (1 packet) to loss list");
-                    const int num = m_pSndLossList->insert(losslist[i], losslist[i]);
+                    const int num = insertLossWithDeadline(losslist[i], losslist[i]);
 
                     enterCS(m_StatsLock);
                     m_stats.sndr.lost.count(num);
@@ -9974,6 +9982,260 @@ bool srt::CUDT::checkRexmitRightTime(int offset, const srt::sync::steady_clock::
     return true;
 }
 
+// [[using locked (m_RecvAckLock)]]
+steady_clock::time_point srt::CUDT::computeRexmitDeadline(int offset) const
+{
+    // The receiver plays the packet out at:
+    //   origin_timestamp + peer TSBPD latency (playback deadline).
+    // The retransmission must leave the sender early enough to cover the
+    // estimated one-way network travel time. With no directional split
+    // available, the OWD is approximated by half the smoothed RTT. The
+    // user-configured SRTO_REXMITDEADLINE value is an extra safety margin.
+    const steady_clock::time_point origin = m_pSndBuffer->getPacketOriginTime(offset);
+    if (is_zero(origin))
+        return steady_clock::time_point();
+
+    const int64_t peer_delay_us = int64_t(m_iPeerTsbPdDelay_ms) * 1000;
+    const int64_t margin_us    = int64_t(m_config.iRexmitDeadline_ms) * 1000;
+    const int64_t owd_us       = int64_t(m_iSRTT) / 2;
+
+    return origin + microseconds_from(peer_delay_us - owd_us + margin_us);
+}
+
+// [[using locked (m_RecvAckLock)]]
+int srt::CUDT::insertLossWithDeadline(int32_t seqno1, int32_t seqno2)
+{
+    if (m_config.iRexmitDeadline_ms <= 0)
+        return m_pSndLossList->insert(seqno1, seqno2);
+
+    // Deadline-aware mode: every newly recorded loss sequence gets its
+    // playback deadline attached. Sequences outside the current sending
+    // window are inserted without a deadline; they will be handled by the
+    // regular DROPREQ machinery.
+    int inserted = 0;
+    for (int32_t seq = seqno1; CSeqNo::seqcmp(seq, seqno2) <= 0; seq = CSeqNo::incseq(seq))
+    {
+        const int offset = CSeqNo::seqoff(m_iSndLastDataAck, seq);
+        steady_clock::time_point deadline;
+        if (offset >= 0 && offset < m_pSndBuffer->getCurrBufSize())
+        {
+            deadline = computeRexmitDeadline(offset);
+            if (!is_zero(deadline))
+                m_pSndBuffer->setPacketRexmitDeadline(offset, deadline);
+        }
+        inserted += m_pSndLossList->insert(seq, seq, deadline);
+    }
+    return inserted;
+}
+
+// [[using locked (m_RecvAckLock)]]
+std::pair<int32_t, int> srt::CUDT::getDeadlineRexmitOffset()
+{
+    // Deadline-aware retransmission scheduling.
+    //
+    // The loss list is snapshotted under its own lock; all filtering and
+    // selection happens on the snapshot so that no loss-list lock is held
+    // while touching the sender buffer. Candidates are:
+    //  - still present in the loss list,
+    //  - present in the sender buffer (non-negative offset),
+    //  - not previously abandoned by deadline scheduling,
+    //  - not paced out by the rexmit-time algorithm.
+    // Among the feasible candidates the one with the earliest playback
+    // deadline is selected; equal deadlines break to the lowest sequence
+    // number, i.e. the oldest packet. Candidates whose deadline already
+    // passed are abandoned once and never re-enter regular retransmission.
+
+    m_pSndLossList->snapshot(m_RexmitCandidates);
+
+    const steady_clock::time_point time_now = steady_clock::now();
+
+    // Clock anomaly guard. The steady clock is supposed to be monotonic, but
+    // a backward jump (e.g. a platform quirk) must not leave recorded
+    // deadlines permanently in the past and block all retransmissions: on a
+    // detected regression, re-derive deadlines from current time instead of
+    // trusting the stale values.
+    bool clock_rewound = false;
+    if (!is_zero(m_tsLastRexmitSchedule) && time_now < m_tsLastRexmitSchedule)
+    {
+        LOGC(qslog.Warn, log << CONID() << "REXMIT-DL: clock regression detected ("
+                << FormatTime(m_tsLastRexmitSchedule) << " -> " << FormatTime(time_now)
+                << "), recomputing retransmission deadlines");
+        clock_rewound = true;
+        // Drop all deadline values derived from the old time basis so that
+        // they get re-derived below. Loss records themselves stay intact.
+        m_pSndLossList->clearAllDeadlines();
+        // A clock regression invalidates any accumulated pacing-stall time.
+        m_tsRexmitPacedSince = steady_clock::time_point();
+    }
+    m_tsLastRexmitSchedule = time_now;
+
+    int32_t best_seq    = SRT_SEQNO_NONE;
+    int     best_offset = -1;
+    steady_clock::time_point best_deadline;
+    bool    has_outdated   = false; // a snapshot seq predates the ACK point
+    int     n_expired      = 0;    // candidates abandoned as past-deadline
+    int     n_unpaced      = 0;    // candidates currently paced out
+
+    for (size_t i = 0; i < m_RexmitCandidates.size(); ++i)
+    {
+        const int32_t seq = m_RexmitCandidates[i].seq;
+
+        // The loss list may have changed while earlier candidates were
+        // abandoned in this same loop, so confirm membership before acting.
+        if (!m_pSndLossList->find(seq))
+            continue;
+
+        const int offset = CSeqNo::seqoff(m_iSndLastDataAck, seq);
+        if (offset < 0)
+        {
+            // Outside the sender buffer: the legacy path sends a DROPREQ for
+            // the outdated region. Delegate to it after the snapshot scan.
+            has_outdated = true;
+            continue;
+        }
+
+        // A packet already given up by deadline scheduling must never be
+        // re-scheduled for a regular retransmission. It stays out of the way
+        // until ACK/TLPKTDROP releases the block.
+        if (m_pSndBuffer->isRexmitAbandoned(offset))
+            continue;
+
+        // Attach (or refresh) the deadline information across the loss
+        // record and the sending window. The loss list keeps the value used
+        // for ordering; the sender buffer keeps the value with the packet
+        // itself while it remains in the window.
+        steady_clock::time_point deadline = m_RexmitCandidates[i].deadline;
+        if (clock_rewound)
+            deadline = steady_clock::time_point(); // force re-derivation below
+        if (is_zero(deadline))
+        {
+            deadline = computeRexmitDeadline(offset);
+            if (!is_zero(deadline))
+            {
+                m_pSndLossList->insert(seq, seq, deadline);
+                m_pSndBuffer->setPacketRexmitDeadline(offset, deadline);
+            }
+        }
+        else if (is_zero(m_pSndBuffer->getPacketRexmitDeadline(offset)) || clock_rewound)
+        {
+            // Re-entered the queue (repeated NAK), or recovering from a
+            // clock regression: propagate the deadline into the sending window.
+            m_pSndBuffer->setPacketRexmitDeadline(offset, deadline);
+        }
+
+        if (!is_zero(deadline) && deadline <= time_now)
+        {
+            // Too late: a retransmission cannot reach the receiver before
+            // its playback time. Abandon this packet once and for all.
+            HLOGC(qslog.Debug, log << CONID() << "REXMIT-DL: ABANDON %" << seq
+                    << " deadline=" << FormatTime(deadline) << " now=" << FormatTime(time_now));
+            m_pSndBuffer->markRexmitAbandoned(offset);
+            m_pSndLossList->remove(seq);
+            ++n_expired;
+            continue;
+        }
+
+        // Respect the existing rexmit pacing (NAK report / last rexmit time),
+        // so enabling deadline scheduling doesn't change retransmission
+        // frequency semantics.
+        if (!checkRexmitRightTime(offset, time_now))
+        {
+            ++n_unpaced;
+            continue;
+        }
+
+        // Packets without a computable deadline get an epoch value: they are
+        // still eligible, but any dated candidate takes precedence over them.
+        if (best_seq == SRT_SEQNO_NONE
+            || (is_zero(best_deadline) && !is_zero(deadline))
+            || (!is_zero(deadline) && !is_zero(best_deadline) &&
+                (deadline < best_deadline
+                 || (deadline == best_deadline && CSeqNo::seqcmp(seq, best_seq) < 0))))
+        {
+            best_seq      = seq;
+            best_offset   = offset;
+            best_deadline = deadline;
+        }
+    }
+
+    if (best_seq != SRT_SEQNO_NONE)
+    {
+        HLOGC(qslog.Debug, log << CONID() << "REXMIT-DL: selected %" << best_seq
+                << " deadline=" << FormatTime(best_deadline) << " now=" << FormatTime(time_now));
+        // A feasible packet is going out: the pacing-stall timer is reset.
+        m_tsRexmitPacedSince = steady_clock::time_point();
+        return std::make_pair(best_seq, best_offset);
+    }
+
+    if (has_outdated)
+    {
+        // Let the legacy machinery send DROPREQ for the outdated region and
+        // resolve any remaining (non-outdated) sequence in its usual order.
+        return getCleanRexmitOffset();
+    }
+
+    // Liveness guard against permanent sending stalls. If every live
+    // candidate was skipped only because of rexmit pacing (none was past its
+    // deadline), remember when this condition started and, once it has lasted
+    // longer than one rexmit timer interval, force the most urgent packet
+    // (earliest deadline, then oldest sequence) out anyway. A stuck scheduler
+    // must never be able to silence the retransmission path indefinitely.
+    if (n_unpaced > 0 && n_expired == 0)
+    {
+        if (is_zero(m_tsRexmitPacedSince))
+            m_tsRexmitPacedSince = time_now;
+
+        const steady_clock::duration stall_limit =
+            microseconds_from(m_iSRTT + 4 * m_iRTTVar + 2 * COMM_SYN_INTERVAL_US);
+        const steady_clock::duration paced_for = time_now - m_tsRexmitPacedSince;
+
+        if (paced_for >= stall_limit)
+        {
+            int32_t guard_seq    = SRT_SEQNO_NONE;
+            int     guard_offset = -1;
+            steady_clock::time_point guard_deadline;
+            for (size_t i = 0; i < m_RexmitCandidates.size(); ++i)
+            {
+                const int32_t seq = m_RexmitCandidates[i].seq;
+                if (!m_pSndLossList->find(seq))
+                    continue;
+                const int offset = CSeqNo::seqoff(m_iSndLastDataAck, seq);
+                if (offset < 0 || m_pSndBuffer->isRexmitAbandoned(offset))
+                    continue;
+
+                const steady_clock::time_point dl = m_pSndLossList->getDeadline(seq);
+                if (guard_seq == SRT_SEQNO_NONE
+                    || (is_zero(guard_deadline) && !is_zero(dl))
+                    || (!is_zero(dl) && !is_zero(guard_deadline) &&
+                        (dl < guard_deadline
+                         || (dl == guard_deadline && CSeqNo::seqcmp(seq, guard_seq) < 0))))
+                {
+                    guard_seq      = seq;
+                    guard_offset   = offset;
+                    guard_deadline = dl;
+                }
+            }
+
+            if (guard_seq != SRT_SEQNO_NONE)
+            {
+                LOGC(qslog.Warn, log << CONID() << "REXMIT-DL: rexmit pacing stalled for "
+                        << FormatDuration<DUNIT_US>(paced_for)
+                        << ", forcing retransmission of %" << guard_seq);
+                m_tsRexmitPacedSince = steady_clock::time_point();
+                return std::make_pair(guard_seq, guard_offset);
+            }
+        }
+    }
+    else
+    {
+        // No pacing-only stall (empty list, expired-only, abandoned-only):
+        // reset the timer so the next real stall is measured from scratch.
+        m_tsRexmitPacedSince = steady_clock::time_point();
+    }
+
+    return std::make_pair(SRT_SEQNO_NONE, -1);
+}
+
 
 // [[using locked (m_RecvAckLock)]]
 int srt::CUDT::extractCleanRexmitPacket(int32_t seqno, int offset, CPacket& w_packet,
@@ -10063,7 +10325,12 @@ int srt::CUDT::packLostData(CPacket& w_packet)
 
             // Get the first sequence for retransmission, bypassing and taking care of
             // those that are in the forgotten region, as well as required to be rejected.
-            Tie2(seqno, offset) = getCleanRexmitOffset();
+            // When deadline-aware scheduling is enabled, select the feasible lost
+            // packet whose playback deadline is the earliest instead.
+            if (m_config.iRexmitDeadline_ms > 0)
+                Tie2(seqno, offset) = getDeadlineRexmitOffset();
+            else
+                Tie2(seqno, offset) = getCleanRexmitOffset();
 
             if (seqno == SRT_SEQNO_NONE)
                 return 0;
@@ -12402,7 +12669,7 @@ void srt::CUDT::checkRexmitTimer(const steady_clock::time_point& currtime)
         ScopedLock acklock(m_RecvAckLock); // Protect packet retransmission
         // Resend all unacknowledged packets on timeout, but only if there is no packet in the loss list
         const int32_t csn = m_iSndCurrSeqNo;
-        const int     num = m_pSndLossList->insert(m_iSndLastAck, csn);
+        const int     num = insertLossWithDeadline(m_iSndLastAck, csn);
         if (num > 0)
         {
             enterCS(m_StatsLock);

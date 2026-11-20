@@ -72,6 +72,7 @@ using namespace srt::sync;
 
 srt::CSndLossList::CSndLossList(int size)
     : m_caSeq()
+    , m_caDeadline()
     , m_iHead(-1)
     , m_iLength(0)
     , m_iSize(size)
@@ -79,6 +80,7 @@ srt::CSndLossList::CSndLossList(int size)
     , m_ListLock()
 {
     m_caSeq = new Seq[size];
+    m_caDeadline = new time_point[size];
 
     // -1 means there is no data in the node
     for (int i = 0; i < size; ++i)
@@ -94,6 +96,7 @@ srt::CSndLossList::CSndLossList(int size)
 srt::CSndLossList::~CSndLossList()
 {
     delete[] m_caSeq;
+    delete[] m_caDeadline;
     releaseMutex(m_ListLock);
 }
 
@@ -103,6 +106,35 @@ void srt::CSndLossList::traceState() const
 }
 
 int srt::CSndLossList::insert(int32_t seqno1, int32_t seqno2)
+{
+    // No deadline attached: keep the historical behavior where deadlines
+    // of any previously recorded sequences are left untouched.
+    return insert(seqno1, seqno2, time_point());
+}
+
+void srt::CSndLossList::assignDeadlines(int32_t seqno1, int32_t seqno2, const time_point& deadline)
+{
+    // An epoch (zero) deadline means "no deadline": nothing to record.
+    if (is_zero(deadline))
+        return;
+
+    const int len = CSeqNo::seqlen(seqno1, seqno2);
+    int loc = (m_iHead + CSeqNo::seqoff(m_caSeq[m_iHead].seqstart, seqno1) + m_iSize) % m_iSize;
+    for (int i = 0; i < len; ++i)
+    {
+        // Do not overwrite a deadline already recorded for this sequence.
+        if (is_zero(m_caDeadline[loc]))
+            m_caDeadline[loc] = deadline;
+        loc = (loc + 1) % m_iSize;
+    }
+}
+
+void srt::CSndLossList::clearDeadline(int32_t seqno)
+{
+    m_caDeadline[slotOf(seqno)] = time_point();
+}
+
+int srt::CSndLossList::insert(int32_t seqno1, int32_t seqno2, const time_point& deadline)
 {
     if (seqno1 < 0 || seqno2 < 0 ) {
         LOGC(qslog.Error, log << "IPE: Tried to insert negative seqno " << seqno1 << ":" << seqno2
@@ -122,6 +154,7 @@ int srt::CSndLossList::insert(int32_t seqno1, int32_t seqno2)
     if (m_iLength == 0)
     {
         insertHead(0, seqno1, seqno2);
+        assignDeadlines(seqno1, seqno2, deadline);
         return m_iLength;
     }
 
@@ -216,7 +249,113 @@ int srt::CSndLossList::insert(int32_t seqno1, int32_t seqno2)
     }
 
     coalesce(loc);
+    // Record deadlines for the sequences of the requested range that turned
+    // out to be new entries. Already recorded sequences keep their deadline
+    // because assignDeadlines() never overwrites a non-epoch value.
+    assignDeadlines(seqno1, seqno2, deadline);
     return m_iLength - origlen;
+}
+
+bool srt::CSndLossList::remove(int32_t seqno)
+{
+    ScopedLock listguard(m_ListLock);
+
+    if (0 == m_iLength)
+        return false;
+
+    // The sequence must not predate the first recorded loss sequence.
+    if (CSeqNo::seqcmp(seqno, m_caSeq[m_iHead].seqstart) < 0)
+        return false;
+
+    // Locate the node whose range covers seqno. Nodes are kept in sequence
+    // order and each node occupies the physical slot of its seqstart.
+    int node = m_iHead;
+    while (node != -1)
+    {
+        const int32_t range_end = (m_caSeq[node].seqend == SRT_SEQNO_NONE)
+            ? m_caSeq[node].seqstart : m_caSeq[node].seqend;
+
+        if (CSeqNo::seqcmp(seqno, m_caSeq[node].seqstart) < 0)
+            return false; // past the possible coverage, seqno isn't recorded
+        if (CSeqNo::seqcmp(seqno, range_end) <= 0)
+            break;
+        node = m_caSeq[node].inext;
+    }
+    if (node == -1)
+        return false;
+
+    const int32_t range_start = m_caSeq[node].seqstart;
+    const int32_t range_end   = (m_caSeq[node].seqend == SRT_SEQNO_NONE)
+        ? range_start : m_caSeq[node].seqend;
+    const int next = m_caSeq[node].inext;
+
+    // Find the previous node (head has none) for re-linking.
+    int prior = -1;
+    if (node != m_iHead)
+    {
+        prior = m_iHead;
+        while (m_caSeq[prior].inext != node)
+            prior = m_caSeq[prior].inext;
+    }
+
+    if (range_start == range_end)
+    {
+        // Single-element node: unlink and free it.
+        if (prior == -1)
+            m_iHead = next;
+        else
+            m_caSeq[prior].inext = next;
+
+        m_caSeq[node].seqstart = SRT_SEQNO_NONE;
+        m_caSeq[node].seqend   = SRT_SEQNO_NONE;
+        m_caDeadline[node]     = time_point();
+        if (m_iLastInsertPos == node)
+            m_iLastInsertPos = (prior == -1) ? -1 : prior;
+    }
+    else if (seqno == range_start)
+    {
+        // Remove the range head: shift the node one physical slot forward.
+        const int nloc = (node + 1) % m_iSize;
+
+        // nloc cannot be a live node: it is seqno's own slot inside the range.
+        m_caSeq[nloc].seqstart = CSeqNo::incseq(range_start);
+        m_caSeq[nloc].seqend   = m_caSeq[node].seqend;
+        m_caSeq[nloc].inext    = next;
+        if (prior == -1)
+            m_iHead = nloc;
+        else
+            m_caSeq[prior].inext = nloc;
+
+        m_caSeq[node].seqstart = SRT_SEQNO_NONE;
+        m_caSeq[node].seqend   = SRT_SEQNO_NONE;
+        m_caDeadline[node]     = time_point();
+        if (m_iLastInsertPos == node)
+            m_iLastInsertPos = nloc;
+    }
+    else if (seqno == range_end)
+    {
+        // Remove the range tail: shrink the node in place.
+        m_caSeq[node].seqend = (CSeqNo::decseq(range_end) == range_start)
+            ? SRT_SEQNO_NONE : CSeqNo::decseq(range_end);
+        clearDeadline(seqno);
+    }
+    else
+    {
+        // Split the range: node becomes [range_start, seqno-1] and a new
+        // node at seqno's next slot holds [seqno+1, range_end].
+        const int nloc = (slotOf(seqno) + 1) % m_iSize;
+        m_caSeq[nloc].seqstart = CSeqNo::incseq(seqno);
+        m_caSeq[nloc].seqend   = range_end;
+        m_caSeq[nloc].inext    = next;
+
+        m_caSeq[node].seqend = CSeqNo::decseq(seqno);
+        m_caSeq[node].inext  = nloc;
+        clearDeadline(seqno);
+        m_iLastInsertPos = node;
+    }
+
+    --m_iLength;
+    return true;
 }
 
 void srt::CSndLossList::removeUpTo(int32_t seqno)
@@ -225,6 +364,12 @@ void srt::CSndLossList::removeUpTo(int32_t seqno)
 
     if (0 == m_iLength)
         return;
+
+    // Remember the occupied region start so that the deadline entries of the
+    // released physical slots can be cleared. Freed slots must not carry
+    // stale deadlines into a later reuse.
+    const int old_head_slot = m_iHead;
+    const int old_length    = m_iLength;
 
     // Remove all from the head pointer to a node with a larger seq. no. or the list is empty
     int offset = CSeqNo::seqoff(m_caSeq[m_iHead].seqstart, seqno);
@@ -329,6 +474,16 @@ void srt::CSndLossList::removeUpTo(int32_t seqno)
             h = m_caSeq[h].inext;
         }
     }
+
+    // Clear deadline entries of every physical slot released by this call.
+    // The released slots occupy a consecutive region starting at the old head.
+    const int released = old_length - m_iLength;
+    int slot = old_head_slot;
+    for (int i = 0; i < released; ++i)
+    {
+        m_caDeadline[slot] = time_point();
+        slot = (slot + 1) % m_iSize;
+    }
 }
 
 int srt::CSndLossList::getLossLength() const
@@ -340,11 +495,18 @@ int srt::CSndLossList::getLossLength() const
 
 int32_t srt::CSndLossList::popLostSeq()
 {
+    time_point unused;
+    return popLostSeq(unused);
+}
+
+int32_t srt::CSndLossList::popLostSeq(time_point& w_deadline)
+{
     ScopedLock listguard(m_ListLock);
 
     if (0 == m_iLength)
     {
         SRT_ASSERT(m_iHead == -1);
+        w_deadline = time_point();
         return SRT_SEQNO_NONE;
     }
 
@@ -353,12 +515,14 @@ int32_t srt::CSndLossList::popLostSeq()
 
     // return the first loss seq. no.
     const int32_t seqno = m_caSeq[m_iHead].seqstart;
+    w_deadline = m_caDeadline[m_iHead];
 
     // head moves to the next node
     if (SRT_SEQNO_NONE == m_caSeq[m_iHead].seqend)
     {
         //[3, SRT_SEQNO_NONE] becomes [], and head moves to next node in the list
         m_caSeq[m_iHead].seqstart = SRT_SEQNO_NONE;
+        m_caDeadline[m_iHead]     = time_point();
         m_iHead                   = m_caSeq[m_iHead].inext;
     }
     else
@@ -372,6 +536,7 @@ int32_t srt::CSndLossList::popLostSeq()
 
         m_caSeq[m_iHead].seqstart = SRT_SEQNO_NONE;
         m_caSeq[m_iHead].seqend   = SRT_SEQNO_NONE;
+        m_caDeadline[m_iHead]     = time_point();
 
         m_caSeq[loc].inext = m_caSeq[m_iHead].inext;
         m_iHead            = loc;
@@ -380,6 +545,73 @@ int32_t srt::CSndLossList::popLostSeq()
     m_iLength--;
 
     return seqno;
+}
+
+srt::CSndLossList::time_point srt::CSndLossList::getDeadline(int32_t seqno) const
+{
+    ScopedLock listguard(m_ListLock);
+
+    if (0 == m_iLength)
+        return time_point();
+    if (CSeqNo::seqcmp(seqno, m_caSeq[m_iHead].seqstart) < 0)
+        return time_point();
+
+    // The deadline array is indexed per sequence position relative to the
+    // head, so the slot is valid for every sequence within the occupied
+    // region even if no node starts at that physical slot.
+    const int loc = slotOf(seqno);
+    return m_caDeadline[loc];
+}
+
+bool srt::CSndLossList::find(int32_t seqno) const
+{
+    ScopedLock listguard(m_ListLock);
+
+    if (0 == m_iLength)
+        return false;
+
+    int p = m_iHead;
+    while (p != -1)
+    {
+        const int32_t range_end = (m_caSeq[p].seqend == SRT_SEQNO_NONE)
+            ? m_caSeq[p].seqstart : m_caSeq[p].seqend;
+        if (CSeqNo::seqcmp(seqno, m_caSeq[p].seqstart) < 0)
+            return false;
+        if (CSeqNo::seqcmp(seqno, range_end) <= 0)
+            return true;
+        p = m_caSeq[p].inext;
+    }
+    return false;
+}
+
+void srt::CSndLossList::snapshot(std::vector<LossEntry>& w_entries) const
+{
+    ScopedLock listguard(m_ListLock);
+    w_entries.clear();
+    if (m_iLength > 0)
+        w_entries.reserve(m_iLength);
+
+    int p = m_iHead;
+    while (p != -1)
+    {
+        const int32_t range_end = (m_caSeq[p].seqend == SRT_SEQNO_NONE)
+            ? m_caSeq[p].seqstart : m_caSeq[p].seqend;
+        for (int32_t seq = m_caSeq[p].seqstart;
+             CSeqNo::seqcmp(seq, range_end) <= 0;
+             seq = CSeqNo::incseq(seq))
+        {
+            const int loc = slotOf(seq);
+            w_entries.push_back(LossEntry { seq, m_caDeadline[loc] });
+        }
+        p = m_caSeq[p].inext;
+    }
+}
+
+void srt::CSndLossList::clearAllDeadlines()
+{
+    ScopedLock listguard(m_ListLock);
+    for (int i = 0; i < m_iSize; ++i)
+        m_caDeadline[i] = time_point();
 }
 
 void srt::CSndLossList::insertHead(int pos, int32_t seqno1, int32_t seqno2)

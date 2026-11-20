@@ -360,6 +360,7 @@ const OptionTestEntry g_test_matrix_options[] =
     { SRTO_RCVTIMEO,           "SRTO_RCVTIMEO", RestrictionType::POST,    sizeof(int),                -1, INT32_MAX,  -1, 2000, {-2},                                  R | W | G | S | O | I | O },
     //SRTO_RENDEZVOUS
     { SRTO_RETRANSMITALGO, "SRTO_RETRANSMITALGO", RestrictionType::PRE,   sizeof(int),                 0,         1,   1,    0, {-1, 2},                               R | W | G | S | D | O | O },
+    { SRTO_REXMITDEADLINE, "SRTO_REXMITDEADLINE", RestrictionType::PRE,   sizeof(int),                 0,  INT32_MAX,   0,  100, {-1},                                   R | W | G | S | D | O | O },
     //SRTO_REUSEADDR
     //SRTO_SENDER
     { SRTO_SNDBUF,              "SRTO_SNDBUF",  RestrictionType::PREBIND, sizeof(int), (int)(32 * SRT_PKT_SIZE), 2147483256, (int)(8192 * SRT_PKT_SIZE), 1000000, {-1},R | W | G | S | D | O | M },

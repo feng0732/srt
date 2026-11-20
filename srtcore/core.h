@@ -56,6 +56,7 @@ modified by
 
 #include <deque>
 #include <sstream>
+#include <vector>
 #include "srt.h"
 #include "common.h"
 #include "list.h"
@@ -1015,6 +1016,17 @@ private:
 private: // Sending related data
     CSndBuffer* m_pSndBuffer;                    // Sender buffer
     CSndLossList* m_pSndLossList;                // Sender loss list
+    // Reusable scratch storage for the deadline-aware retransmission scheduler.
+    // Only accessed from the sending thread under m_RecvAckLock (packLostData path).
+    std::vector<CSndLossList::LossEntry> m_RexmitCandidates;
+    // Last "now" observed by the deadline scheduler. Used to detect clock
+    // anomalies (backward jumps of an otherwise-monotonic steady clock) so
+    // that stale recorded deadlines can never permanently block sending.
+    srt::sync::steady_clock::time_point m_tsLastRexmitSchedule;
+    // Start of an ongoing period during which every feasible retransmission
+    // candidate is being held back solely by rexmit pacing. Drives the
+    // liveness guard that forces a retransmission after one rexmit interval.
+    srt::sync::steady_clock::time_point m_tsRexmitPacedSince;
     CPktTimeWindow<16, 16> m_SndTimeWindow;      // Packet sending time window
 #ifdef ENABLE_MAXREXMITBW
     size_t m_zSndAveragePacketSize;
@@ -1286,6 +1298,26 @@ private: // Generation and processing of packets
 
     std::pair<int32_t, int> getCleanRexmitOffset();
     bool checkRexmitRightTime(int offset, const srt::sync::steady_clock::time_point& current_time);
+
+    /// Deadline-aware retransmission: pick the lost packet with the earliest
+    /// playback deadline that can still arrive at the receiver in time.
+    /// Packets already past their deadline are abandoned once (marked in the
+    /// sender buffer and removed from the loss list) and never re-enter
+    /// regular retransmission. Used only when SRTO_REXMITDEADLINE is enabled.
+    /// @return (sequence number, sender-buffer offset), or (SRT_SEQNO_NONE, -1).
+    std::pair<int32_t, int> getDeadlineRexmitOffset();
+
+    /// Compute the latest local time at which a retransmission of the packet
+    /// at @a offset can be sent and still reach the receiver before its
+    /// playback deadline.
+    srt::sync::steady_clock::time_point computeRexmitDeadline(int offset) const;
+
+    /// Insert a loss range into the sender loss list. When deadline-aware
+    /// scheduling is enabled, the per-packet deadlines are computed from the
+    /// sender buffer and recorded together with the loss records.
+    /// [[using locked (m_RecvAckLock)]]
+    int insertLossWithDeadline(int32_t seqno1, int32_t seqno2);
+
     /// Reads the packet to retransmit at @a offset. If its message has expired (TTL),
     /// sends the drop request, removes the dropped range from the loss list and
     /// returns CSndBuffer::READ_DROP: the caller then picks up the next lost sequence.

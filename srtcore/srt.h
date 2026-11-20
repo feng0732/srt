@@ -239,6 +239,7 @@ typedef enum SRT_SOCKOPT {
 #ifdef ENABLE_MAXREXMITBW
    SRTO_MAXREXMITBW = 63,    // Maximum bandwidth limit for retransmision (Bytes/s)
 #endif
+   SRTO_REXMITDEADLINE = 64, // Extra safety margin (ms) for deadline-aware retransmission scheduling (0 to disable)
 
    SRTO_E_SIZE // Always last element, not a valid option.
 } SRT_SOCKOPT;

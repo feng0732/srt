@@ -923,6 +923,19 @@ struct CSrtConfigSetter<SRTO_RETRANSMITALGO>
     }
 };
 
+template<>
+struct CSrtConfigSetter<SRTO_REXMITDEADLINE>
+{
+    static void set(CSrtConfig& co, const void* optval, int optlen)
+    {
+        const int val = cast_optval<int>(optval, optlen);
+        if (val < 0)
+            throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+        co.iRexmitDeadline_ms = val;
+    }
+};
+
 #ifdef ENABLE_AEAD_API_PREVIEW
 template<>
 struct CSrtConfigSetter<SRTO_CRYPTOMODE>
@@ -1044,6 +1057,7 @@ int dispatchSet(SRT_SOCKOPT optName, CSrtConfig& co, const void* optval, int opt
         DISPATCH(SRTO_IPV6ONLY);
         DISPATCH(SRTO_PACKETFILTER);
         DISPATCH(SRTO_RETRANSMITALGO);
+        DISPATCH(SRTO_REXMITDEADLINE);
 #ifdef ENABLE_AEAD_API_PREVIEW
         DISPATCH(SRTO_CRYPTOMODE);
 #endif

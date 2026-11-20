@@ -211,6 +211,8 @@ void CSndBuffer::addBuffer(const char* data, int len, SRT_MSGCTRL& w_mctrl)
 
         s->m_iTTL = ttl;
         s->m_tsRexmitTime = time_point();
+        s->m_tsRexmitDeadline = time_point();
+        s->m_bRexmitAbandoned = false;
         s->m_tsOriginTime = m_tsLastOriginTime;
         
         // Should never happen, as the call to increase() should ensure enough buffers.
@@ -286,6 +288,9 @@ int CSndBuffer::addBufferFromFile(fstream& ifs, int len)
 
         s->m_iLength = pktlen;
         s->m_iTTL    = SRT_MSGTTL_INF;
+        s->m_tsRexmitTime = time_point();
+        s->m_tsRexmitDeadline = time_point();
+        s->m_bRexmitAbandoned = false;
         s            = s->m_pNext;
 
         total += pktlen;
@@ -545,6 +550,76 @@ sync::steady_clock::time_point CSndBuffer::getPacketRexmitTime(const int offset)
 
     SRT_ASSERT(p);
     return p->m_tsRexmitTime;
+}
+
+void CSndBuffer::setPacketRexmitDeadline(const int offset, const steady_clock::time_point& deadline)
+{
+    ScopedLock bufferguard(m_BufLock);
+    Block* p = m_pFirstBlock;
+    for (int i = 0; i < offset; ++i)
+    {
+        SRT_ASSERT(p);
+        p = p->m_pNext;
+    }
+
+    SRT_ASSERT(p);
+    p->m_tsRexmitDeadline = deadline;
+}
+
+CSndBuffer::time_point CSndBuffer::getPacketRexmitDeadline(const int offset) const
+{
+    ScopedLock bufferguard(m_BufLock);
+    const Block* p = m_pFirstBlock;
+    for (int i = 0; i < offset; ++i)
+    {
+        SRT_ASSERT(p);
+        p = p->m_pNext;
+    }
+
+    SRT_ASSERT(p);
+    return p->m_tsRexmitDeadline;
+}
+
+void CSndBuffer::markRexmitAbandoned(const int offset)
+{
+    ScopedLock bufferguard(m_BufLock);
+    Block* p = m_pFirstBlock;
+    for (int i = 0; i < offset; ++i)
+    {
+        SRT_ASSERT(p);
+        p = p->m_pNext;
+    }
+
+    SRT_ASSERT(p);
+    p->m_bRexmitAbandoned = true;
+}
+
+bool CSndBuffer::isRexmitAbandoned(const int offset) const
+{
+    ScopedLock bufferguard(m_BufLock);
+    const Block* p = m_pFirstBlock;
+    for (int i = 0; i < offset; ++i)
+    {
+        SRT_ASSERT(p);
+        p = p->m_pNext;
+    }
+
+    SRT_ASSERT(p);
+    return p->m_bRexmitAbandoned;
+}
+
+CSndBuffer::time_point CSndBuffer::getPacketOriginTime(const int offset) const
+{
+    ScopedLock bufferguard(m_BufLock);
+    const Block* p = m_pFirstBlock;
+    for (int i = 0; i < offset; ++i)
+    {
+        SRT_ASSERT(p);
+        p = p->m_pNext;
+    }
+
+    SRT_ASSERT(p);
+    return p->m_tsOriginTime;
 }
 
 void CSndBuffer::ackData(int offset)

@@ -260,6 +260,7 @@ struct CSrtConfig: CSrtMuxerConfig
     int      iPeerIdleTimeout_ms; // Timeout for hearing anything from the peer (ms).
     uint32_t uMinStabilityTimeout_ms;
     int      iRetransmitAlgo;
+    int      iRexmitDeadline_ms; // SRTO_REXMITDEADLINE: extra rexmit safety margin (ms); 0 disables deadline-aware scheduling
     int      iCryptoMode; // SRTO_CRYPTOMODE
 
     int64_t llInputBW;         // Input stream rate (bytes/sec). 0: use internally estimated input bandwidth
@@ -315,6 +316,7 @@ struct CSrtConfig: CSrtMuxerConfig
         , iPeerIdleTimeout_ms(COMM_RESPONSE_TIMEOUT_MS)
         , uMinStabilityTimeout_ms(COMM_DEF_MIN_STABILITY_TIMEOUT_MS)
         , iRetransmitAlgo(1)
+        , iRexmitDeadline_ms(0)
         , iCryptoMode(CIPHER_MODE_AUTO)
         , llInputBW(0)
         , llMinInputBW(0)

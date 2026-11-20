@@ -165,6 +165,35 @@ public:
     SRT_ATTR_EXCLUDES(m_BufLock)
     time_point getPacketRexmitTime(const int offset);
 
+    /// @brief Record the retransmission (playback) deadline for a packet in the sending window.
+    /// The deadline is attached to the block at @a offset and follows the packet while it
+    /// remains in the sending window (ACK/TLPKTDROP simply release the blocks later).
+    /// @param [in] offset offset from the last ACK point (backward sequence number difference).
+    /// @param [in] deadline latest local time at which a retransmission can still arrive
+    ///             in time for the receiver's playback. An epoch time clears the deadline.
+    SRT_ATTR_EXCLUDES(m_BufLock)
+    void setPacketRexmitDeadline(const int offset, const time_point& deadline);
+
+    /// @brief Read the retransmission deadline recorded for a packet in the sending window.
+    /// @return The recorded deadline, or an epoch time_point if none was recorded.
+    SRT_ATTR_EXCLUDES(m_BufLock)
+    time_point getPacketRexmitDeadline(const int offset) const;
+
+    /// @brief Mark the packet as given up for deadline-aware retransmission.
+    /// A marked packet is never re-scheduled for regular retransmission while it
+    /// stays in the sending window. The mark is released together with the block
+    /// (on ACK/TLPKTDROP), so block reuse starts from a clean state.
+    SRT_ATTR_EXCLUDES(m_BufLock)
+    void markRexmitAbandoned(const int offset);
+
+    /// @brief Check whether the packet was given up for deadline-aware retransmission.
+    SRT_ATTR_EXCLUDES(m_BufLock)
+    bool isRexmitAbandoned(const int offset) const;
+
+    /// @brief Read the origin timestamp of the packet at the given sender-buffer offset.
+    SRT_ATTR_EXCLUDES(m_BufLock)
+    time_point getPacketOriginTime(const int offset) const;
+
     /// Update the ACK point and may release/unmap/return the user data according to the flag.
     /// @param [in] offset number of packets acknowledged.
     int32_t getMsgNoAt(const int offset);
@@ -228,6 +257,8 @@ private:
         int32_t    m_iSeqNo;       // sequence number for scheduling
         time_point m_tsOriginTime; // block origin time (either provided from above or equals the time a message was submitted for sending.
         time_point m_tsRexmitTime; // packet retransmission time
+        time_point m_tsRexmitDeadline; // latest time a retransmission can still meet the receiver's playback deadline (epoch if unset)
+        bool       m_bRexmitAbandoned; // true if this packet was given up by deadline-aware scheduling
         int        m_iTTL; // time to live (milliseconds)
 
         Block* m_pNext; // next block

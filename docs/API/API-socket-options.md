@@ -258,6 +258,7 @@ The following table lists SRT API socket options in alphabetical order. Option d
 | [`SRTO_RCVTIMEO`](#SRTO_RCVTIMEO)                       |       | post     | `int32_t` | ms      | -1                | -1, 0..  | RW  | GSI   |
 | [`SRTO_RENDEZVOUS`](#SRTO_RENDEZVOUS)                   |       | pre      | `bool`    |         | false             |          | RW  | S     |
 | [`SRTO_RETRANSMITALGO`](#SRTO_RETRANSMITALGO)           | 1.4.2 | pre      | `int32_t` |         | 1                 | [0, 1]   | RW  | GSD   |
+| [`SRTO_REXMITDEADLINE`](#SRTO_REXMITDEADLINE)           | WIP   | pre      | `int32_t` | ms      | 0                 | 0..      | RW  | GSD   |
 | [`SRTO_REUSEADDR`](#SRTO_REUSEADDR)                     |       | pre-bind | `bool`    |         | true              |          | RW  | GSD   |
 | [`SRTO_SENDER`](#SRTO_SENDER)                           | 1.0.4 | pre      | `bool`    |         | false             |          | W   | S     |
 | [`SRTO_SNDBUF`](#SRTO_SNDBUF)                           |       | pre-bind | `int32_t` | bytes   | 8192 payloads     | \*       | RW  | GSD+  |
@@ -1508,6 +1509,42 @@ certain time or not.
 
 NOTE: The efficient retransmission algorithm can only be used when a receiver sends
 Periodic NAK reports. See [SRTO_NAKREPORT](#SRTO_NAKREPORT).
+
+[Return to list](#list-of-options)
+
+---
+
+#### SRTO_REXMITDEADLINE
+
+| OptName              | Since | Restrict | Type      | Units | Default | Range | Dir | Entity |
+| -------------------- | ----- | -------- | --------- | ----- | ------- | ----- | --- | ------ |
+| `SRTO_REXMITDEADLINE`| WIP   | pre      | `int32_t` | ms    | 0       | 0..   | RW  | GSD    |
+
+Enables deadline-aware retransmission scheduling on the sending side. The value
+is an extra safety margin, in milliseconds, added when the sender computes the
+latest time at which a retransmission may be sent and still reach the receiver
+before the packet's playback time (origin timestamp plus the peer's TSBPD
+latency, minus half the smoothed RTT).
+
+- 0 (default): deadline-aware scheduling is disabled. Retransmission behavior
+  is exactly the legacy one (see [SRTO_RETRANSMITALGO](#SRTO_RETRANSMITALGO)).
+- A positive value enables the scheduler. Lost packets then carry their
+  retransmission deadline through the sender loss records, the retransmission
+  queue and the sending window. At every retransmission opportunity the sender:
+  - abandons packets whose deadline has already passed. Such packets are marked
+    in the sending window and never re-enter regular retransmission while they
+    remain unacknowledged;
+  - otherwise retransmits the feasible lost packet with the earliest playback
+    deadline first. Equal deadlines break to the lowest (oldest) sequence
+    number.
+
+ACK/NAK processing, congestion control and the behavior with the option unset
+stay unchanged. The scheduler is based on the monotonic steady clock and
+re-derives its deadlines if a clock regression is detected, so a system clock
+jump cannot permanently block sending.
+
+NOTE: This option is effective only on the sending side and must be set before
+the socket is connected.
 
 [Return to list](#list-of-options)
 

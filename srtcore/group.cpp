@@ -864,6 +864,8 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
         RD(0);
     case SRTO_RETRANSMITALGO:
         RD(1);
+    case SRTO_REXMITDEADLINE:
+        RD(0);
     }
 
 #undef RD
