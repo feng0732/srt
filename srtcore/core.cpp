@@ -8080,10 +8080,11 @@ bool srt::CUDT::updateCC(ETransmissionEvent evt, const EventVariant arg)
             // Use the values:
             // - if SRTO_MAXBW is >0, use it.
             // - if SRTO_MAXBW == 0, use SRTO_INPUTBW + SRTO_OHEADBW
+            //   (+ the negotiated packet-filter/FEC redundancy overhead)
             // - if SRTO_INPUTBW == 0, pass 0 to request in-buffer sampling
             // Bytes/s
-            const int64_t bw = m_config.llMaxBW != 0 ? m_config.llMaxBW :                   // When used SRTO_MAXBW
-                               m_config.llInputBW != 0 ? withOverhead(m_config.llInputBW) : // SRTO_INPUTBW + SRT_OHEADBW
+            const int64_t bw = m_config.llMaxBW != 0 ? m_config.llMaxBW :                             // When used SRTO_MAXBW (manual: unchanged)
+                               m_config.llInputBW != 0 ? withRecoveryAndFilterOverhead(m_config.llInputBW) : // SRTO_INPUTBW + OHEADBW + FEC
                                0; // When both MAXBW and INPUTBW are 0, request in-buffer sampling
 
             // Note: setting bw == 0 uses BW_INFINITE value in LiveCC
@@ -8128,7 +8129,11 @@ bool srt::CUDT::updateCC(ETransmissionEvent evt, const EventVariant arg)
              * Keep previously set maximum in that case (inputbw == 0).
              */
             if (inputbw >= 0)
-                m_CongCtl->updateBandwidth(0, withOverhead(std::max(m_config.llMinInputBW, inputbw))); // Bytes/sec
+                // The sampled rate covers source payload only; reserve room
+                // for retransmissions (SRTO_OHEADBW) and for the negotiated
+                // FEC/filter redundancy so that all of them stay within the
+                // effective sending limit.
+                m_CongCtl->updateBandwidth(0, withRecoveryAndFilterOverhead(std::max(m_config.llMinInputBW, inputbw))); // Bytes/sec
         }
     }
 

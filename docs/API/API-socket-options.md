@@ -1046,6 +1046,14 @@ skyrocket when larger groups of packets are lost
 `SRTO_INPUTBW` option set to 0 (automatic). Otherwise your stream will choke
 and break quickly at any rise in packet loss.
 
+- This overhead reserves room for retransmission and control traffic. When a
+packet filter (e.g. FEC, see [`SRTO_PACKETFILTER`](#SRTO_PACKETFILTER)) is
+negotiated, its redundancy packets are accounted separately and automatically:
+the FEC overhead derived from the negotiated matrix is applied on top of this
+recovery overhead, so both share the same effective rate limit without either
+one being counted twice. An explicit `SRTO_MAXBW` disables this automatic
+accounting and applies the fixed limit unchanged.
+
 - ***To do: set-only; get should be supported.***
 
 [Return to list](#list-of-options)

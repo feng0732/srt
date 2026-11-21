@@ -39,6 +39,51 @@ namespace srt {
 
 const char FECFilterBuiltin::defaultConfig [] = "fec,rows:1,layout:staircase,arq:onreq";
 
+int FECFilterBuiltin::extraBandwidthOverheadPercent() const
+{
+    // Number of FEC control packets generated per matrix of source packets:
+    //
+    // - row-only (m_number_rows == 1):
+    //     1 horizontal FEC packet per m_number_cols source packets,
+    // - columns-only (m_cols_only):
+    //     1 vertical FEC packet per m_number_rows source packets,
+    // - full matrix:
+    //     m_number_cols vertical + m_number_rows horizontal FEC packets
+    //     per (m_number_cols * m_number_rows) source packets.
+    //
+    // FEC control packets carry a payload clip of the same size as the
+    // source payload (plus a fixed 4-byte FEC header), so the packet ratio
+    // is, to within a negligible constant, also the byte/bandwidth ratio.
+    //
+    // The ceiling division (n + d - 1) / d makes sure the reserved budget
+    // is never smaller than the redundancy actually put on the wire.
+    size_t fec_packets = 0;
+    size_t source_packets = 0;
+
+    if (m_cols_only)
+    {
+        // One vertical FEC packet per column group of m_number_rows packets.
+        fec_packets = 1;
+        source_packets = m_number_rows;
+    }
+    else if (m_number_rows <= 1)
+    {
+        // Row-only: one horizontal FEC packet per row of m_number_cols packets.
+        fec_packets = 1;
+        source_packets = m_number_cols;
+    }
+    else
+    {
+        // Full matrix: m_number_rows row groups + m_number_cols column groups,
+        // each group producing one FEC packet, over cols*rows source packets.
+        source_packets = m_number_cols * m_number_rows;
+        fec_packets = m_number_cols + m_number_rows;
+    }
+
+    // Sizes are bounded by MAX_GROUP_SIZE, so this cannot overflow size_t.
+    return int((fec_packets * 100 + source_packets - 1) / source_packets);
+}
+
 struct StringKeys
 {
     string operator()(const pair<const string, const string> item)

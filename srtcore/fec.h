@@ -316,6 +316,19 @@ public:
 
     virtual SRT_ARQLevel arqLevel() ATR_OVERRIDE { return m_fallback_level; }
 
+    /// Extra bandwidth percentage consumed by the generated FEC control
+    /// packets, relative to the source data stream.
+    ///
+    /// The number of FEC packets per matrix of (cols * rows) source packets
+    /// is:
+    /// - row-only (rows == 1): one horizontal FEC packet per cols packets,
+    /// - columns-only (m_cols_only): one vertical FEC packet per rows packets,
+    /// - full matrix: (cols + rows) FEC packets per (cols * rows) packets.
+    ///
+    /// The result is rounded UP to whole percent so that the reserved budget
+    /// never falls short of the actually generated redundancy.
+    int extraBandwidthOverheadPercent() const ATR_OVERRIDE;
+
     static const char defaultConfig [];
     static bool verifyConfig(const SrtFilterConfig& config, std::string& w_errormsg);
 };

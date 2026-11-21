@@ -230,6 +230,27 @@ the start of each column increment by 1, in a staircase (non-block aligned)
 matrix arrangement, the packet sequence numbers at the start of each column
 increment by R+1, where R is the row size.
 
+### Automatic bandwidth accounting
+
+When the maximum bandwidth is not fixed explicitly (`SRTO_MAXBW` left at its
+default of 0, i.e. the automatic input-rate based controller), the bandwidth
+needed by the FEC control packets is derived from the negotiated matrix
+configuration and reserved automatically inside the effective sending limit.
+The redundancy ratio depends on the matrix shape:
+
+- row-only (`rows:1`): one FEC packet per `cols` source packets,
+- columns-only (negative `rows`): one FEC packet per `|rows|` source packets,
+- full matrix: `cols + rows` FEC packets per `cols * rows` source packets.
+
+This FEC overhead is combined with the recovery overhead of `SRTO_OHEADBW`
+(which keeps room for retransmissions and control traffic), so that FEC
+redundancy, retransmissions and control packets all stay within the same
+effective rate limit instead of being sent on top of the media budget. The
+source (media) rate itself is never reduced, and the ratio is rounded up so
+the reserved budget never falls short of the traffic actually generated.
+Setting an explicit `SRTO_MAXBW` switches to the fixed, manual limit, which is
+applied unchanged exactly as without a packet filter.
+
 Let's again imagine a matrix of 10 columns and 5 rows starting from sequence 500.
 The rows begin with sequences numbers 500, 510, 520, 530 and 540. But the columns
 begin in staggered fashion, separated by an interval of R+1. The colours represent

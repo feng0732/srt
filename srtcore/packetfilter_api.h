@@ -156,6 +156,21 @@ protected:
     // and it should be a stable value set ONCE, after the filter module is ready.
     virtual SRT_ARQLevel arqLevel() = 0;
 
+    /// Percentage of extra traffic (filter control packets, e.g. FEC
+    /// redundancy) that this filter generates on top of the source data
+    /// stream, in percent of the source rate.
+    ///
+    /// The value is derived solely from the negotiated filter configuration,
+    /// so it is constant for the lifetime of a configured filter. Filters
+    /// that do not generate any extra traffic return 0.
+    ///
+    /// It is used by the automatic bandwidth controller to reserve room in
+    /// the sending budget for filter-generated packets, so that they are
+    /// accounted against the effective rate limit instead of being sent on
+    /// top of it.
+    /// @return Extra-bandwidth percentage, e.g. 25 means 25% overhead.
+    virtual int extraBandwidthOverheadPercent() const { return 0; }
+
     virtual ~SrtPacketFilterBase()
     {
     }
