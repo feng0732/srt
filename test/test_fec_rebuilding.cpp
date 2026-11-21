@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <future>
 #include <thread>
+#include <set>
+#include <utility>
 
 #include "gtest/gtest.h"
 #include "test_env.h"
@@ -1078,6 +1080,316 @@ TEST_F(TestFECRebuilding, ForgetRebuiltFromCorrupted)
     ASSERT_EQ(provided.size(), 1U);
     expectSameContents(*source[4], provided[0]);
 }
+
+// ---------------------------------------------------------------------------
+// Sender-side group state consistency when packets are skipped by the sender
+// (e.g. dropped due to TTL expiry) and therefore never fed through
+// feedSource(). The FEC groups must keep describing only the media that was
+// really sent: skipped packets must not be covered by any parity, and the
+// parity collected before the skip must not pollute the following groups.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// Creates a single data packet with the given sequence/message number and
+// deterministic contents, like the packets prepared by the fixture.
+unique_ptr<CPacket> makeSourcePacket(int32_t seq, int32_t msgno, int sockid, int timestamp)
+{
+    unique_ptr<CPacket> p(new CPacket);
+    p->allocate(SRT_LIVE_MAX_PLSIZE);
+
+    uint32_t* hdr = p->getHeader();
+    hdr[SRT_PH_SEQNO] = seq;
+    // In live mode every packet is a separate message.
+    hdr[SRT_PH_MSGNO] = MSGNO_SEQ::wrap(msgno) | MSGNO_PACKET_BOUNDARY::wrap(PB_SOLO);
+    hdr[SRT_PH_ID] = sockid;
+    hdr[SRT_PH_TIMESTAMP] = timestamp;
+
+    const size_t length = 732 + (size_t(seq) % 500);
+    p->setLength(length);
+    for (size_t b = 0; b < length; ++b)
+        p->data()[b] = char((seq * 31 + int(b)) % 251);
+
+    return p;
+}
+
+// Simulates the sender-side packet loop (CUDT::packData): before feeding
+// every new packet it drains all pending FEC/CTL packets, exactly as
+// packData() does by calling packControlPacket() before packUniqueData()
+// (and again in the next cycle if a control packet was provided). Skipped
+// sequences (TTL expiry) are reported through feedSourceSkip(), like
+// CUDT::packUniqueData() does.
+struct SenderSim
+{
+    FECFilterBuiltin& fec;
+    int32_t last_sent;
+
+    // Data packets actually sent, in send order.
+    vector<unique_ptr<CPacket> > sent;
+    // FEC/CTL packets emitted, together with the number of data packets
+    // sent before them (their position on the wire).
+    vector< pair<size_t, unique_ptr<SrtPacket> > > emitted;
+
+    SenderSim(FECFilterBuiltin& f, int32_t isn)
+        : fec(f), last_sent(CSeqNo::decseq(isn))
+    {
+    }
+
+    void drainControl()
+    {
+        for (;;)
+        {
+            SrtPacket ctl(SRT_LIVE_MAX_PLSIZE);
+            if (!fec.packControlPacket(ctl, last_sent))
+                break;
+            emitted.push_back(make_pair(sent.size(), unique_ptr<SrtPacket>(new SrtPacket(ctl))));
+        }
+    }
+
+    void sendNext(int32_t msgno, int sockid, int timestamp)
+    {
+        drainControl();
+        const int32_t seq = CSeqNo::incseq(last_sent);
+        sent.push_back(makeSourcePacket(seq, msgno, sockid, timestamp));
+        fec.feedSource(*sent.back());
+        last_sent = seq;
+    }
+
+    // Skips nskip consecutive sequences starting right after the last sent
+    // packet, as if their messages expired (TTL) before being sent.
+    void skip(int nskip)
+    {
+        const int32_t seq_base = CSeqNo::incseq(last_sent);
+        fec.feedSourceSkip(seq_base, nskip);
+        last_sent = CSeqNo::incseq(seq_base, nskip - 1);
+    }
+};
+
+unique_ptr<CPacket> wrapCtl(SrtPacket& sp)
+{
+    unique_ptr<CPacket> p(new CPacket);
+    memcpy(p->getHeader(), sp.hdr, SRT_PH_E_SIZE * sizeof(uint32_t));
+    p->m_pcData = sp.buffer;
+    p->setLength(sp.length);
+    p->set_msgflags(MSGNO_PACKET_BOUNDARY::wrap(PB_SOLO));
+    p->setMsgCryptoFlags(EncryptionKeySpec(0));
+    return p;
+}
+
+// Passes the packets recorded by SenderSim through the receiver side of the
+// filter, dropping the data packets whose sequence numbers are in lost_seqs
+// (simulated network loss). Rebuilt packets land in the 'provided' vector
+// bound to the filter.
+void runReceiver(FECFilterBuiltin& fec, SenderSim& snd, const set<int32_t>& lost_seqs)
+{
+    FECFilterBuiltin::loss_seqs_t loss;
+    size_t ctlx = 0;
+    for (size_t i = 0; i < snd.sent.size(); ++i)
+    {
+        for (; ctlx < snd.emitted.size() && snd.emitted[ctlx].first == i; ++ctlx)
+        {
+            unique_ptr<CPacket> ctl = wrapCtl(*snd.emitted[ctlx].second);
+            EXPECT_FALSE(fec.receive(*ctl, loss));
+        }
+        if (lost_seqs.count(snd.sent[i]->getSeqNo()))
+            continue;
+        EXPECT_TRUE(fec.receive(*snd.sent[i], loss));
+    }
+    for (; ctlx < snd.emitted.size(); ++ctlx)
+    {
+        unique_ptr<CPacket> ctl = wrapCtl(*snd.emitted[ctlx].second);
+        EXPECT_FALSE(fec.receive(*ctl, loss));
+    }
+}
+
+CPacket* findBySeq(const vector<unique_ptr<CPacket> >& pkts, int32_t seq)
+{
+    for (size_t i = 0; i < pkts.size(); ++i)
+        if (pkts[i]->getSeqNo() == seq)
+            return pkts[i].get();
+    return NULL;
+}
+
+void expectRebuilt(CPacket& orig, const SrtPacket& rebuilt)
+{
+    EXPECT_EQ(orig.getHeader()[SRT_PH_SEQNO], rebuilt.hdr[SRT_PH_SEQNO]);
+    EXPECT_EQ(orig.getHeader()[SRT_PH_TIMESTAMP], rebuilt.hdr[SRT_PH_TIMESTAMP]);
+    EXPECT_EQ(orig.getHeader()[SRT_PH_ID], rebuilt.hdr[SRT_PH_ID]);
+    ASSERT_EQ(orig.size(), rebuilt.size());
+    EXPECT_EQ(memcmp(orig.data(), rebuilt.data(), rebuilt.size()), 0);
+}
+
+} // anonymous namespace
+
+// A group interrupted by a skip must not emit any FEC/CTL packet: the
+// receiver would otherwise rebuild the skipped (expired) packets as if
+// they had been sent.
+TEST_F(TestFECRebuilding, SkipMidGroupNotEmitted)
+{
+    SenderSim sndsim(*fec, isn);
+
+    int32_t msgno = 1;
+    for (int i = 0; i < 3; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+
+    sndsim.skip(2); // isn+3, isn+4 expired before being sent
+
+    // Feed the rest of the interrupted group and the first packet of the
+    // next one (which closes the interrupted group on the sender).
+    for (int i = 5; i < 8; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+
+    // The interrupted group [isn, isn+6] must not have been emitted.
+    EXPECT_EQ(sndsim.emitted.size(), 0U);
+
+    // The next, untouched group must be completed and emitted normally.
+    for (int i = 8; i < 14; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+    sndsim.drainControl();
+
+    ASSERT_EQ(sndsim.emitted.size(), 1U);
+
+    // The packet lost on the wire in the second group must be rebuilt from
+    // its parity, proving that the partial parity of the interrupted group
+    // did not pollute it.
+    provided.clear();
+    set<int32_t> lost;
+    lost.insert(isn + 9);
+    runReceiver(*fec, sndsim, lost);
+
+    ASSERT_EQ(provided.size(), 1U);
+    CPacket* orig = findBySeq(sndsim.sent, isn + 9);
+    ASSERT_TRUE(orig != NULL);
+    expectRebuilt(*orig, provided[0]);
+}
+
+// A skip spanning whole groups must resynchronize the group base with the
+// sequence-based layout, so that the first complete group after the skip
+// is emitted and protects its packets.
+TEST_F(TestFECRebuilding, SkipSpanningGroupsResyncs)
+{
+    SenderSim sndsim(*fec, isn);
+
+    int32_t msgno = 1;
+    for (int i = 0; i < 3; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+
+    // Expire isn+3 .. isn+13: the rest of group [isn, isn+6] and the whole
+    // group [isn+7, isn+13].
+    sndsim.skip(11);
+
+    // Feed the whole group [isn+14, isn+20].
+    for (int i = 14; i < 21; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+    sndsim.drainControl();
+
+    // The group right after the skip must be emitted - the group base must
+    // have been resynchronized over the whole skipped range.
+    ASSERT_EQ(sndsim.emitted.size(), 1U);
+
+    provided.clear();
+    set<int32_t> lost;
+    lost.insert(isn + 16);
+    runReceiver(*fec, sndsim, lost);
+
+    ASSERT_EQ(provided.size(), 1U);
+    CPacket* orig = findBySeq(sndsim.sent, isn + 16);
+    ASSERT_TRUE(orig != NULL);
+    expectRebuilt(*orig, provided[0]);
+}
+
+// Neither the skipped packets nor any other packet of a group interrupted
+// by a skip may be rebuilt - no parity is emitted for such a group, so the
+// receiver can only report the packets as irrecoverable.
+TEST_F(TestFECRebuilding, SkipPlusLossNotRebuilt)
+{
+    SenderSim sndsim(*fec, isn);
+
+    int32_t msgno = 1;
+    for (int i = 0; i < 3; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+
+    sndsim.skip(2); // isn+3, isn+4 expired
+
+    for (int i = 5; i < 14; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+    sndsim.drainControl();
+
+    ASSERT_EQ(sndsim.emitted.size(), 1U); // only the second, complete group
+
+    provided.clear();
+    set<int32_t> lost;
+    lost.insert(isn + 1); // lost on the wire in the interrupted group
+    lost.insert(isn + 9); // lost on the wire in the complete group
+    runReceiver(*fec, sndsim, lost);
+
+    // Only the packet from the complete group may be rebuilt. The packet
+    // lost in the interrupted group is unrecoverable, and the skipped
+    // (expired) packets must never be rebuilt as if they were sent media.
+    ASSERT_EQ(provided.size(), 1U);
+    CPacket* orig = findBySeq(sndsim.sent, isn + 9);
+    ASSERT_TRUE(orig != NULL);
+    expectRebuilt(*orig, provided[0]);
+}
+
+// Same resynchronization must happen for the vertical (column) groups:
+// a skip spanning whole column series must not desynchronize the column
+// bases from the sequence-based layout.
+TEST(TestFECSkip, ColumnsResyncAfterSkip)
+{
+    const int sockid = 54321;
+    const int32_t isn = 123456;
+    const size_t plsize = 1316;
+
+    SrtFilterInitializer init = {
+        sockid,
+        isn - 1,
+        isn - 1,
+        plsize,
+        CSrtConfig::DEF_BUFFER_SIZE
+    };
+
+    vector<SrtPacket> provided;
+    FECFilterBuiltin fec(init, provided, "fec,cols:4,rows:3,layout:even");
+
+    SenderSim sndsim(fec, isn);
+
+    int32_t msgno = 1;
+    for (int i = 0; i < 3; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+
+    // Expire isn+3 .. isn+26: two full column series (rows:3 x cols:4).
+    sndsim.skip(24);
+
+    // Feed two full matrices after the skip.
+    for (int i = 27; i < 52; ++i)
+        sndsim.sendNext(msgno++, sockid, 10 + 10 * i);
+    sndsim.drainControl();
+
+    // Expected control packets with resynchronized groups:
+    // - vertical: column 3 of series [27,31,35] (the only column of that
+    //   series not interrupted by the skip) and all 4 columns of the next
+    //   series [36..47],
+    // - horizontal: complete rows [28..31] .. [48..51].
+    ASSERT_EQ(sndsim.emitted.size(), 11U);
+
+    set<int32_t> lost;
+    lost.insert(isn + 30); // recoverable through the horizontal group [28..31]
+    lost.insert(isn + 45); // recoverable through the vertical column [37,41,45]
+    runReceiver(fec, sndsim, lost);
+
+    ASSERT_EQ(provided.size(), 2U);
+    for (size_t i = 0; i < provided.size(); ++i)
+    {
+        const int32_t seq = provided[i].hdr[SRT_PH_SEQNO];
+        ASSERT_TRUE(seq == isn + 30 || seq == isn + 45);
+        CPacket* orig = findBySeq(sndsim.sent, seq);
+        ASSERT_TRUE(orig != NULL);
+        expectRebuilt(*orig, provided[i]);
+    }
+}
+
 
 class TestFECRebuildingMsgNo: public TestFECRebuilding
 {

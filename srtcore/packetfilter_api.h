@@ -134,6 +134,18 @@ protected:
     /// @param [INOUT] packet The packet about to send
     virtual void feedSource(CPacket& packet) = 0;
 
+    /// This is called when the sender has skipped a sequence of consecutive
+    /// packets that will never be sent (e.g. dropped due to TTL expiry) and
+    /// therefore will never be passed to feedSource(). The filter should
+    /// treat the skipped sequence range as a gap in the source stream: it
+    /// must not be covered by any control (parity) data, and any group state
+    /// intersecting the gap must be consistently closed or reset, so that
+    /// the parity, sequence numbers and group counts produced afterwards
+    /// stay in sync with the receiver's recovery window.
+    /// @param [IN] seq_base Sequence number of the first skipped packet
+    /// @param [IN] nskip Number of consecutive skipped packets
+    virtual void feedSourceSkip(int32_t /*seq_base*/, int /*nskip*/) {}
+
 
     // Receiver side
 

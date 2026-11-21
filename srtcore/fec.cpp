@@ -535,12 +535,73 @@ void FECFilterBuiltin::feedSource(CPacket& packet)
     HLOGC(pflog.Debug, log << "FEC collected: H: " << snd.row.collected << " V[" << vert_gx << "]: " << snd.cols[vert_gx].collected);
 }
 
+void FECFilterBuiltin::feedSourceSkip(int32_t seq_base, int nskip)
+{
+    if (nskip < 1)
+        return;
+
+    // The sequence number of the first packet that will still be sent
+    // (and therefore fed through feedSource). All sequences in
+    // [seq_base, next_seq) have been skipped by the sender (e.g. dropped
+    // due to TTL expiry) and will never be fed, so they must not be
+    // covered by any FEC parity.
+    const int32_t next_seq = CSeqNo::incseq(seq_base, nskip);
+
+    HLOGC(pflog.Debug, log << "FEC:feedSourceSkip: %" << seq_base << " +(" << nskip
+            << ") -> next to send %" << next_seq);
+
+    // Resync the horizontal (row) group exactly as if a packet with
+    // next_seq was being fed, but without clipping any data. Groups whose
+    // span is fully covered by the skipped range are closed and their
+    // partial parity is discarded. A group only partially covered by the
+    // skipped range keeps its state: it can never reach the emission
+    // condition (not all of its packets will be fed), and it will be
+    // reset when the next group boundary is crossed.
+    const int baseoff = CSeqNo::seqoff(snd.row.base, next_seq);
+    if (baseoff > 0 && CheckGroupClose(snd.row, size_t(baseoff), sizeRow()))
+    {
+        HLOGC(pflog.Debug, log << "FEC:feedSourceSkip: HORIZ group closed over skip, B=%" << snd.row.base);
+    }
+
+    // Don't do any column handling if using column size 1
+    if (sizeCol() < 2)
+        return;
+
+    // Same resync for the vertical (column) groups.
+    for (size_t gx = 0; gx < snd.cols.size(); ++gx)
+    {
+        const int vert_off = CSeqNo::seqoff(snd.cols[gx].base, next_seq);
+        if (vert_off <= 0)
+        {
+            // The group base is at or past the first still-to-be-sent
+            // sequence, so the skip didn't touch this group.
+            continue;
+        }
+
+        if (CheckGroupClose(snd.cols[gx], size_t(vert_off) / sizeRow(), sizeCol()))
+        {
+            HLOGC(pflog.Debug, log << "FEC:feedSourceSkip: VERT group [" << gx
+                    << "] closed over skip, B=%" << snd.cols[gx].base);
+        }
+    }
+}
+
 bool FECFilterBuiltin::CheckGroupClose(Group& g, size_t pos, size_t size)
 {
     if (pos < size)
         return false;
 
-    ResetGroup(g);
+    // The fed position lies past the current group's span. When packets
+    // were skipped by the sender (e.g. dropped due to TTL expiry) or lost
+    // in a burst, the group base may lag behind the sequence-based group
+    // layout by more than one span. Reset the group as many times as
+    // needed so that its base again matches the layout that the receiver
+    // derives from the sequence numbers. Every reset discards the clip
+    // collected so far: a group interrupted by a gap must neither be
+    // emitted nor pollute the parity of the next group.
+    for (size_t nreset = pos / size; nreset != 0; --nreset)
+        ResetGroup(g);
+
     return true;
 }
 

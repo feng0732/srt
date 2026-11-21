@@ -10577,6 +10577,13 @@ bool srt::CUDT::packUniqueData(CPacket& w_packet)
         if (pktskipseqno)
         {
             // Some packets were skipped due to TTL expiry.
+            // Inform the packet filter about the gap in the source stream
+            // so that it can resynchronize its sender groups: the skipped
+            // packets must not be covered by any filter control (parity)
+            // data. The first skipped sequence is the one right after the
+            // last sent packet.
+            if (m_PacketFilter)
+                m_PacketFilter.feedSourceSkip(CSeqNo::incseq(m_iSndCurrSeqNo), pktskipseqno);
             m_iSndCurrSeqNo = CSeqNo::incseq(m_iSndCurrSeqNo, pktskipseqno);
             HLOGC(qslog.Debug, log << "packUniqueData: reading skipped " << pktskipseqno << " seq up to %" << m_iSndCurrSeqNo
                     << " due to TTL expiry");

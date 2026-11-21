@@ -285,6 +285,12 @@ public:
     // FEC control packet ready to send.
     virtual void feedSource(CPacket& r_packet) ATR_OVERRIDE;
 
+    // This is called when the sender has skipped a sequence of packets
+    // (e.g. dropped due to TTL expiry) that will therefore never be fed
+    // through feedSource. The sender groups are resynchronized so that
+    // the skipped range is not covered by any FEC parity.
+    virtual void feedSourceSkip(int32_t seq_base, int nskip) ATR_OVERRIDE;
+
     // Receiver side
 
     // This function is called at the moment when a new data packet has

@@ -202,6 +202,7 @@ public:
 
     // Simple wrappers
     void feedSource(CPacket& w_packet) { SRT_ASSERT(m_filter); return m_filter->feedSource((w_packet)); }
+    void feedSourceSkip(int32_t seq_base, int nskip) { SRT_ASSERT(m_filter); m_filter->feedSourceSkip(seq_base, nskip); }
     SRT_ARQLevel arqLevel() { SRT_ASSERT(m_filter); return m_filter->arqLevel(); }
     bool packControlPacket(int32_t seq, int kflg, CPacket& w_packet);
     void receive(CUnit* unit, std::vector<CUnit*>& w_incoming, loss_seqs_t& w_loss_seqs);
